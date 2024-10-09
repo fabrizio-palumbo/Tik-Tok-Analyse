@@ -10,10 +10,12 @@ import os
 import pandas as pd
 from pathlib import Path
 from time import time
-from transformers import pipeline, AutoTokenizer, AutoModelForTokenClassification
+from transformers import pipeline, AutoTokenizer, AutoModelForTokenClassification, AutoModelForSeq2SeqLM
 from tqdm import tqdm
 import seaborn as sns
 import matplotlib.pyplot as plt
+import numpy as np
+import networkx as nx
 
 #%%
 
@@ -113,12 +115,12 @@ def perform_ner(transcriptions, model_name='NbAiLab/nb-bert-base'):
 
     ners = []
     entities_mapping = {}
-    for i, transcription in tqdm(enumerate(transcriptions), desc='Estimating NER'):
+    for i, transcription in tqdm(enumerate(transcriptions), desc='Estimating NER', total=len(transcriptions)):
         t = time()
         result = classifier_NER(transcription)
         ners.append(result)
-        names, locations, geo_locations, geo_orgs, orgs,events, dvts, miscelaneous, products = merge_and_extract_entities(result)
-        entities_mapping[i] = {'Names': names, 'Locations': locations, 'Geo Locations':geo_locations, 'Geo organizzation':geo_orgs, 'Organizzation':orgs, 'Events':events, 'Dvts':dvts, 'Miscelaneous':miscelaneous, 'Products':products}
+        names, locations, geo_locations, geo_orgs, orgs,events, dvts, miscellaneous, products = merge_and_extract_entities(result)
+        entities_mapping[i] = {'Names': names, 'Locations': locations, 'Geo Locations':geo_locations, 'Geo organization':geo_orgs, 'Organization':orgs, 'Events':events, 'Dvts':dvts, 'Miscellaneous':miscellaneous, 'Products':products}
 
     print(f"NER completed in {time() - t:.2f} seconds")
     return entities_mapping
@@ -149,7 +151,7 @@ def merge_and_extract_entities(ner_results):
     products=[]
     current_entity_type = None
     dvts=[]
-    miscelaneous=[]
+    miscellaneous=[]
     for token in ner_results:
         word = token['word']
         entity_type = token['entity'][2:]  # Extract entity type (e.g., 'PER' from 'B-PER')
@@ -179,7 +181,7 @@ def merge_and_extract_entities(ner_results):
                 elif current_entity_type == 'DVT':
                     dvts.append(current_entity)
                 elif current_entity_type == 'MISC':
-                    miscelaneous.append(current_entity)
+                    miscellaneous.append(current_entity)
                 elif current_entity_type == 'PROD':
                     products.append(current_entity)
                 # Reset for the new entity
@@ -209,7 +211,7 @@ def merge_and_extract_entities(ner_results):
         elif current_entity_type == 'DVT':
             dvts.append(current_entity)
         elif current_entity_type == 'MISC':
-            miscelaneous.append(current_entity)
+            miscellaneous.append(current_entity)
         elif current_entity_type == 'PROD':
             products.append(current_entity)
     # Combine multi-token entities into single strings
@@ -220,11 +222,88 @@ def merge_and_extract_entities(ner_results):
     orgs = [' '.join(org) for org in orgs]
     events = [' '.join(event) for event in events]
     dvts=[' '.join(dvts) for dvt in dvts]
-    miscelaneous=[' '.join(miscelaneou) for miscelaneou in miscelaneous]
+    miscellaneous=[' '.join(miscellaneous) for miscellaneous in miscellaneous]
     products=[' '.join(product) for product in products]
 
-    return names, locations, geo_locations, geo_orgs, orgs, events,dvts, miscelaneous,products
+    return names, locations, geo_locations, geo_orgs, orgs, events, dvts, miscellaneous, products
 
+
+#%% Function to parse the generated text and extract the triplets (relation extraction)
+
+def extract_triplets_typed(transcriptions):
+    
+    # Load model and tokenizer
+    # tokenizer = AutoTokenizer.from_pretrained("Babelscape/mrebel-large") 
+    # model = AutoModelForSeq2SeqLM.from_pretrained("Babelscape/mrebel-large")
+    tokenizer = AutoTokenizer.from_pretrained("ltg/nort5-base", trust_remote_code=True) 
+    model = AutoModelForSeq2SeqLM.from_pretrained("ltg/nort5-base", trust_remote_code=True)
+    
+    gen_kwargs = {
+        "length_penalty": 0,
+        "num_beams": 3,
+        "num_return_sequences": 1,
+        "forced_bos_token_id": None,
+    }
+    
+    relations = []
+    
+    for i, transcription in tqdm(enumerate(transcriptions), desc='Extracting relations', total=len(transcriptions)):
+        t = time()
+
+        # Tokenizer text
+        model_inputs = tokenizer(transcription, max_length=256, padding=True, truncation=True, return_tensors = 'pt')
+        
+        # Generate
+        generated_tokens = model.generate(
+            model_inputs["input_ids"].to(model.device),
+            attention_mask=model_inputs["attention_mask"].to(model.device),
+            decoder_start_token_id = tokenizer.convert_tokens_to_ids("tp_XX"),
+            **gen_kwargs,
+        )
+        
+        # Extract text
+        decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=False)
+
+
+        triplets = []
+        relation = ''
+        text = decoded_preds[0].strip()
+        current = 'x'
+        subject, relation, object_, object_type, subject_type = '','','','',''
+    
+        for token in text.replace("<s>", "").replace("<pad>", "").replace("</s>", "").replace("tp_XX", "").replace("__en__", "").split():
+            if token == "<triplet>" or token == "<relation>":
+                current = 't'
+                if relation != '':
+                    triplets.append({'head': subject.strip(), 'head_type': subject_type, 'type': relation.strip(),'tail': object_.strip(), 'tail_type': object_type})
+                    relation = ''
+                subject = ''
+            elif token.startswith("<") and token.endswith(">"):
+                if current == 't' or current == 'o':
+                    current = 's'
+                    if relation != '':
+                        triplets.append({'head': subject.strip(), 'head_type': subject_type, 'type': relation.strip(),'tail': object_.strip(), 'tail_type': object_type})
+                    object_ = ''
+                    subject_type = token[1:-1]
+                else:
+                    current = 'o'
+                    object_type = token[1:-1]
+                    relation = ''
+            else:
+                if current == 't':
+                    subject += ' ' + token
+                elif current == 's':
+                    object_ += ' ' + token
+                elif current == 'o':
+                    relation += ' ' + token
+        if subject != '' and relation != '' and object_ != '' and object_type != '' and subject_type != '':
+            triplets.append({'head': subject.strip(), 'head_type': subject_type, 'type': relation.strip(),'tail': object_.strip(), 'tail_type': object_type})
+        
+        relations.append(triplets)
+        
+    print(f"Relation extraction completed in {time() - t:.2f} seconds")
+    return relations
+    
 
 #%% Main loop
 
@@ -243,20 +322,23 @@ if __name__ == "__main__":
     dfScript = dfScript.drop('Unnamed: 0', axis=1)
     dfScript.rename(columns={'0':'transcription'}, inplace=True)
 
-    emotion_labels = ['glad', 'trist', 'overrasket', 'nøytral', 'redd', 'avsky', 'sint']
-    sentiments = analyze_sentiments(dfScript['transcription'].tolist(), emotion_labels)
+    sentiment_columns = ['glad', 'trist', 'overrasket', 'nøytral', 'redd', 'avsky', 'sint']
+    sentiments = analyze_sentiments(dfScript['transcription'].tolist(), sentiment_columns)
 
-    candidate_labels = ["sykdom", "sport", "helse", "religion", 'miljø', 'klima']
-    labels = label_topics(dfScript['transcription'].tolist(), candidate_labels)
+    topic_columns = ["sykdom", "sport", "helse", "religion", 'miljø', 'politikk', 'økonomi']
+    labels = label_topics(dfScript['transcription'].tolist(), topic_columns)
 
     entities_mapping = perform_ner(dfScript['transcription'].tolist())
+
+    extracted_triplets = extract_triplets_typed(dfScript['transcription'].tolist())
 
     # Combine results and save to CSV
     result_df = pd.DataFrame({
         'transcription': dfScript['transcription'],
         **pd.DataFrame(sentiments),
         **pd.DataFrame(labels),
-        **pd.DataFrame(entities_mapping)
+        **pd.DataFrame.from_dict(entities_mapping, orient='index'),
+        **pd.DataFrame(extracted_triplets)
     })
     save_to_csv(result_df, output_dir, 'audio_analysis_output.csv')
 
@@ -264,23 +346,72 @@ if __name__ == "__main__":
 
 #%% Heatmap
 
-    sentiment_columns = ['glad', 'trist', 'overrasket', 'nøytral', 'redd', 'avsky', 'sint']
-    topic_columns = ['sykdom', 'sport', 'helse', 'religion', 'miljø', 'klima']
 
-    topic_counts = result_df[topic_columns].sum().values
-    sentiment_counts = result_df[sentiment_columns].sum().values
+    ad_matrix = np.zeros(shape=[len(topic_columns), len(sentiment_columns)])
+    for i, col in enumerate(topic_columns):
+        query = '%s > 0.6' %col
+        ad_matrix[i,:] = result_df.query(query)[sentiment_columns].mean().values
 
-    association_df = pd.DataFrame(index=topic_columns, columns=sentiment_columns)
+    ad_matrix = np.nan_to_num(ad_matrix)
 
-    for topic in topic_columns:
-        for sentiment in sentiment_columns:
-            association_df.loc[topic, sentiment] = (result_df.loc[result_df[topic] > 0, sentiment].mean() if result_df[topic].sum() > 0 else 0)
+    # topic_counts = result_df[topic_columns].sum().values
+    # sentiment_counts = result_df[sentiment_columns].sum().values
 
-    association_df = association_df.astype(float)
+    # association_df = pd.DataFrame(index=topic_columns, columns=sentiment_columns)
+
+    # for topic in topic_columns:
+    #     for sentiment in sentiment_columns:
+    #         association_df.loc[topic, sentiment] = (result_df.loc[result_df[topic] > 0, sentiment].mean() if result_df[topic].sum() > 0 else 0)
+
+    # association_df = association_df.astype(float)
+    
+    association_df = pd.DataFrame(data=ad_matrix, index=topic_columns, columns=sentiment_columns)
 
     plt.figure(figsize=(10, 8))
     sns.heatmap(association_df, annot=True, cmap='coolwarm', cbar=True, fmt=".2f", linewidths=.5)
     plt.title('Sentiment Scores Associated with Topics')
     plt.xlabel('Sentiment')
     plt.ylabel('Topics')
-    plt.show()
+    
+    G = nx.from_numpy_array(ad_matrix)
+    pos = nx.circular_layout(G)
+    
+    edges,weights = zip(*nx.get_edge_attributes(G,'weight').items())
+    
+    node_labels = {}
+    for i, topic in enumerate(topic_columns):
+        node_labels[i] = topic
+
+    
+    pos = nx.spring_layout(G)
+    nx.draw(G,  node_color='b', labels=node_labels, edgelist=edges, edge_color=weights, width=10.0, edge_cmap=plt.cm.Blues)
+
+
+    # nx.draw(G, node_color='#00b4d9', pos=pos, with_labels=True) 
+
+
+
+#%% Function to color entities
+    # def color_entities(transcript, doc):
+    #     colored_text = transcript
+    
+    #     # Define colors for different entity types
+    #     colors = {
+    #         "PERSON": "blue",
+    #         "ORG": "green",
+    #         "GPE": "orange",  # Geographic entities
+    #         # Add more entity types and colors as needed
+    #     }
+    
+    #     # Loop through named entities and replace them with colored HTML
+    #     for ent in doc.ents:
+    #         if ent.label_ in colors:
+    #             colored_text = colored_text.replace(ent.text, f'<span style="color: {colors[ent.label_]};">{ent.text}</span>')
+    
+    #     return colored_text
+    
+    # # Get the colored transcript
+    # colored_transcript = color_entities(transcript)
+    
+    # # Display the colored transcript
+    # display(HTML(colored_transcript))
